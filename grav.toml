@@ -1,0 +1,7 @@
+name = "apogee-storage"
+lib = "src/all.grav"
+grav = ">=1.10.0"
+paths = ["src"]
+
+[dependencies]
+apogee-crypt = "github.com/venomous-maker/apogee-crypt@v0.1.0"

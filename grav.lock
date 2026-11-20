@@ -1,0 +1,2 @@
+# grav.lock: exact commits of the installed dependencies (generated; commit this file)
+apogee-crypt = { source = "github.com/venomous-maker/apogee-crypt", version = "v0.1.0", commit = "294365f614f8eb114c1a2dc68eddcc11f5d519e0" }
