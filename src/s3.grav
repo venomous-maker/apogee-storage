@@ -1,0 +1,409 @@
+// s3.grav — a disk in an S3 bucket: Amazon S3, or any service that speaks its
+// API (Cloudflare R2, Backblaze B2, DigitalOcean Spaces, SeaweedFS, MinIO, ...).
+// Requests are signed with AWS Signature Version 4; temporary URLs are
+// presigned GETs.
+//
+//   new S3Disk(S3Config.aws("my-bucket", "eu-west-1", accessKey, secretKey))
+//   new S3Disk(S3Config.compatible("http://127.0.0.1:8333", "my-bucket", accessKey, secretKey))
+import "std"
+import "std/net"
+import "storage.grav"
+
+namespace apogee {
+
+    // Where a bucket is and how to sign for it.
+    class S3Config {
+        public bucket: string
+        public region: string
+        public accessKey: string
+        public secretKey: string
+        // A temporary credential's token (sent as X-Amz-Security-Token), else "".
+        public sessionToken: string = ""
+        // "https://s3.<region>.amazonaws.com", or another service's address.
+        public endpoint: string
+        // The bucket in the path (`endpoint/bucket/key`) rather than the host name
+        // (`bucket.endpoint/key`): what most S3-compatible services want.
+        public pathStyle: bool
+        // Public URLs start with this instead of the bucket's own address (a CDN).
+        public publicUrl: string = ""
+
+        constructor(bucket: string, region: string, accessKey: string, secretKey: string, endpoint: string, pathStyle: bool) {
+            self.bucket = bucket;
+            self.region = region;
+            self.accessKey = accessKey;
+            self.secretKey = secretKey;
+            self.endpoint = Str.endsWith(endpoint, "/") ? endpoint[..endpoint.length - 1] : endpoint;
+            self.pathStyle = pathStyle;
+        }
+        // An Amazon S3 bucket.
+        static fn aws(bucket: string, region: string, accessKey: string, secretKey: string) -> S3Config {
+            return new S3Config(bucket, region, accessKey, secretKey, "https://s3.${region}.amazonaws.com", false);
+        }
+        // A bucket on another S3-compatible service at `endpoint` (path style).
+        static fn compatible(endpoint: string, bucket: string, accessKey: string, secretKey: string,
+                             region: string = "us-east-1") -> S3Config {
+            return new S3Config(bucket, region, accessKey, secretKey, endpoint, true);
+        }
+    }
+
+    // AWS Signature Version 4: the canonical request, the string to sign, the
+    // derived key and the signature (docs.aws.amazon.com, "Signature Version 4").
+    class SigV4 {
+        // "Authorization" for a request; `headers` (names lower-case) are all signed
+        // and must include host and x-amz-date.
+        static fn authorization(method: string, path: string, query: SortedMap<string, string>,
+                                headers: SortedMap<string, string>, payloadHash: string, accessKey: string,
+                                secretKey: string, region: string, service: string, amzDate: string) -> string {
+            let scope = amzDate[..8] + "/" + region + "/" + service + "/aws4_request";
+            let sig = SigV4.signature(method, path, query, headers, payloadHash, secretKey, region, service, amzDate);
+            return "AWS4-HMAC-SHA256 Credential=" + accessKey + "/" + scope + ", SignedHeaders=" +
+                   SigV4.signedHeaders(headers) + ", Signature=" + sig;
+        }
+        static fn signature(method: string, path: string, query: SortedMap<string, string>,
+                            headers: SortedMap<string, string>, payloadHash: string, secretKey: string,
+                            region: string, service: string, amzDate: string) -> string {
+            let scope = amzDate[..8] + "/" + region + "/" + service + "/aws4_request";
+            let canonical = SigV4.canonicalRequest(method, path, query, headers, payloadHash);
+            let toSign = "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + Hash.sha256(canonical);
+            return SigV4.hmac(SigV4.signingKey(secretKey, amzDate[..8], region, service), toSign).toHex();
+        }
+        static fn canonicalRequest(method: string, path: string, query: SortedMap<string, string>,
+                                   headers: SortedMap<string, string>, payloadHash: string) -> string {
+            let sb = new StringBuilder();
+            sb.append(method).appendChar(10).append(path).appendChar(10);
+            let first = true;
+            for ((k, v) in query) {
+                if (!first) { sb.appendChar(38); }
+                first = false;
+                sb.append(SigV4.uriEncode(k, false)).appendChar(61).append(SigV4.uriEncode(v, false));
+            }
+            sb.appendChar(10);
+            for ((k, v) in headers) { sb.append(k).appendChar(58).append(Str.trim(v)).appendChar(10); }
+            sb.appendChar(10).append(SigV4.signedHeaders(headers)).appendChar(10).append(payloadHash);
+            return sb.toString();
+        }
+        static fn signedHeaders(headers: SortedMap<string, string>) -> string {
+            let names = new Array<string>();
+            for ((k, _) in headers) { names.push(k); }
+            return Str.join(names, ";");
+        }
+        static fn signingKey(secretKey: string, date: string, region: string, service: string) -> Bytes {
+            let k = SigV4.hmac(Bytes.fromString("AWS4" + secretKey), date);
+            k = SigV4.hmac(k, region);
+            k = SigV4.hmac(k, service);
+            return SigV4.hmac(k, "aws4_request");
+        }
+        // HMAC-SHA256 under a binary key (the standard library's primitive).
+        static fn hmac(key: Bytes, message: string) -> Bytes {
+            let k = key.rawData();
+            let kn = key.size();
+            let hex = %{ grav_h_hmac_sha256(k, (size_t)kn, (const unsigned char*)message, (size_t)grav_str_len(message)) %} as string;
+            return Bytes.fromHex(hex);
+        }
+        // RFC 3986 percent-encoding as Signature V4 wants it: A-Z a-z 0-9 - _ . ~
+        // kept, everything else %XX (upper-case); "/" kept when `keepSlash`.
+        static fn uriEncode(s: string, keepSlash: bool) -> string {
+            let sb = new StringBuilder();
+            sb.reserve(s.length + 8);
+            for (i in 0..s.length) {
+                let c = s[i] as int;
+                if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
+                    c == 45 || c == 95 || c == 46 || c == 126 || (keepSlash && c == 47)) {
+                    sb.appendChar(c);
+                } else {
+                    sb.appendChar(37).appendChar(SigV4.hexDigit(c >> 4)).appendChar(SigV4.hexDigit(c & 15));
+                }
+            }
+            return sb.toString();
+        }
+        private static fn hexDigit(d: int) -> int { return d < 10 ? 48 + d : 55 + d; }
+        // "20150830T123600Z" for unix seconds (UTC).
+        static fn amzDate(unix: long) -> string {
+            let days = unix / 86400;
+            let secs = unix % 86400;
+            let ymd = Civil.fromDays(days);
+            return Civil.pad(ymd[0], 4) + Civil.pad(ymd[1], 2) + Civil.pad(ymd[2], 2) + "T" +
+                   Civil.pad((secs / 3600) as int, 2) + Civil.pad(((secs / 60) % 60) as int, 2) +
+                   Civil.pad((secs % 60) as int, 2) + "Z";
+        }
+    }
+
+    // Calendar dates and days since 1970-01-01 (UTC), both ways (H. Hinnant's
+    // civil-from-days algorithms).
+    class Civil {
+        static fn fromDays(z0: long) -> int[3] {
+            let z = z0 + 719468;
+            let era = (z >= 0 ? z : z - 146096) / 146097;
+            let doe = z - era * 146097;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let m = mp < 10 ? mp + 3 : mp - 9;
+            let y = yoe + era * 400 + (m <= 2 ? 1 : 0);
+            let out: int[3] = [y as int, m as int, d as int];
+            return out;
+        }
+        static fn toDays(y0: int, m: int, d: int) -> long {
+            let y = (m <= 2 ? y0 - 1 : y0) as long;
+            let era = (y >= 0 ? y : y - 399) / 400;
+            let yoe = y - era * 400;
+            let mm = m as long;
+            let doy = (153 * (mm > 2 ? mm - 3 : mm + 9) + 2) / 5 + (d as long) - 1;
+            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            return era * 146097 + doe - 719468;
+        }
+        static fn pad(n: int, width: int) -> string { return Str.padLeft(str(n), width, "0"); }
+        // Unix seconds for an HTTP date ("Fri, 20 Nov 2026 18:52:09 GMT"), else 0.
+        static fn httpDate(s: string) -> long {
+            let p = Str.split(Str.trim(s), " ");
+            if (p.size() < 5) { return 0; }
+            let months: Array<string> = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            let m = months.indexOf(p[2]) + 1;
+            let t = Str.split(p[4], ":");
+            if (m == 0 || t.size() != 3) { return 0; }
+            let days = Civil.toDays(Integer.parseOr(p[3], 1970) as int, m, Integer.parseOr(p[1], 1) as int);
+            return days * 86400 + Integer.parseOr(t[0], 0) * 3600 + Integer.parseOr(t[1], 0) * 60 + Integer.parseOr(t[2], 0);
+        }
+    }
+
+    // A disk in an S3 bucket.
+    class S3Disk extends Disk {
+        public config: S3Config
+        private client: HttpClient
+        private lock: Mutex
+        private scheme: string
+        private hostPort: string     // the endpoint's host[:port]
+
+        constructor(config: S3Config) {
+            self.config = config;
+            self.client = new HttpClient();
+            self.client.timeoutMs = 30000;
+            self.lock = new Mutex();
+            let e = config.endpoint;
+            let at = Str.indexOf(e, "://");
+            self.scheme = at > 0 ? e[..at] : "https";
+            self.hostPort = at > 0 ? e[at + 3..] : e;
+            let slash = Str.indexOf(self.hostPort, "/");
+            if (slash >= 0) { self.hostPort = self.hostPort[..slash]; }
+        }
+
+        // ── requests ───────────────────────────────────────────────────────────
+        private fn host() -> string { return self.config.pathStyle ? self.hostPort : self.config.bucket + "." + self.hostPort; }
+        // The request path of an object ("" key: the bucket itself).
+        private fn pathOf(key: string) -> string {
+            let k = SigV4.uriEncode(key, true);
+            return self.config.pathStyle ? "/" + self.config.bucket + "/" + k : "/" + k;
+        }
+        private fn send(method: string, key: string, query: SortedMap<string, string>, body: Bytes,
+                        contentType: string, extra: HashMap<string, string>) -> HttpResponse {
+            let path = self.pathOf(key);
+            let payload = body == null ? new Bytes() : body;
+            let hash = Hash.sha256Bytes(payload);
+            let date = SigV4.amzDate(Time.now());
+            let signed = S3Disk.strings();
+            signed.put("host", self.host());
+            signed.put("x-amz-content-sha256", hash);
+            signed.put("x-amz-date", date);
+            if (self.config.sessionToken != "") { signed.put("x-amz-security-token", self.config.sessionToken); }
+            if (extra != null) { for ((k, v) in extra) { signed.put(Str.lower(k), v); } }
+            let auth = SigV4.authorization(method, path, query, signed, hash, self.config.accessKey,
+                                           self.config.secretKey, self.config.region, "s3", date);
+            let headers = new Headers();
+            for ((k, v) in signed) { if (k != "host") { headers.set(k, v); } }
+            headers.set("Authorization", auth);
+            let qs = new StringBuilder();
+            for ((k, v) in query) {
+                qs.appendChar(qs.length() == 0 ? 63 : 38).append(SigV4.uriEncode(k, false)).appendChar(61).append(SigV4.uriEncode(v, false));
+            }
+            let url = self.scheme + "://" + self.host() + path + qs.toString();
+            self.lock.lock();
+            try {
+                let res = self.client.send(method, url, method == "GET" || method == "HEAD" || method == "DELETE" ? null : payload,
+                                           contentType, headers);
+                self.lock.unlock();
+                return res;
+            } catch (e: Exception) {
+                self.lock.unlock();
+                throw new StorageError("S3 ${method} ${path}: " + e.message());
+            }
+        }
+        private fn fail(res: HttpResponse, what: string) -> StorageError {
+            let body = res.body();
+            let code = S3Disk.tag(body, "Code");
+            let msg = S3Disk.tag(body, "Message");
+            return new StorageError("S3 ${what}: HTTP ${res.status}" + (code != "" ? " " + code : "") + (msg != "" ? ": " + msg : ""));
+        }
+        private static fn none() -> SortedMap<string, string> { return S3Disk.strings(); }
+        // An empty map of strings, kept in byte order (what Signature V4 sorts by).
+        static fn strings() -> SortedMap<string, string> { return new SortedMap<string, string>(fn(a: string, b: string) => Str.compare(a, b)); }
+        private fn head(path: string) -> HttpResponse {
+            let key = Disk.clean(path);
+            let res = self.send("HEAD", key, S3Disk.none(), null, "", null);
+            if (res.status == 404) { throw new FileNotFoundError(key); }
+            if (res.status != 200) { throw self.fail(res, "HEAD " + key); }
+            return res;
+        }
+
+        // Makes the bucket (nothing if it is already there and yours).
+        fn createBucket() {
+            let res = self.send("PUT", "", S3Disk.none(), null, "", null);
+            if (res.status == 200 || res.status == 409) { return; }
+            throw self.fail(res, "creating bucket " + self.config.bucket);
+        }
+
+        // ── the disk ───────────────────────────────────────────────────────────
+        fn putBytes(path: string, contents: Bytes) {
+            let key = Disk.clean(path);
+            let res = self.send("PUT", key, S3Disk.none(), contents, Mime.forPath(key), null);
+            if (res.status != 200) { throw self.fail(res, "PUT " + key); }
+        }
+        fn getBytes(path: string) -> Bytes {
+            let key = Disk.clean(path);
+            let res = self.send("GET", key, S3Disk.none(), null, "", null);
+            if (res.status == 404) { throw new FileNotFoundError(key); }
+            if (res.status != 200) { throw self.fail(res, "GET " + key); }
+            return res.bodyBytes;
+        }
+        fn exists(path: string) -> bool {
+            let key = Disk.clean(path);
+            let res = self.send("HEAD", key, S3Disk.none(), null, "", null);
+            if (res.status == 200) { return true; }
+            if (res.status == 404) { return false; }
+            throw self.fail(res, "HEAD " + key);
+        }
+        fn delete(path: string) -> bool {
+            let key = Disk.clean(path);
+            if (!self.exists(key)) { return false; }
+            let res = self.send("DELETE", key, S3Disk.none(), null, "", null);
+            if (res.status != 204 && res.status != 200) { throw self.fail(res, "DELETE " + key); }
+            return true;
+        }
+        fn copy(from: string, to: string) {
+            let src = Disk.clean(from);
+            let extra = new HashMap<string, string>();
+            extra.put("x-amz-copy-source", "/" + self.config.bucket + "/" + SigV4.uriEncode(src, true));
+            let res = self.send("PUT", Disk.clean(to), S3Disk.none(), null, "", extra);
+            if (res.status == 404) { throw new FileNotFoundError(src); }
+            if (res.status != 200 || Str.contains(res.body(), "<Error>")) { throw self.fail(res, "copying " + src); }
+        }
+        fn size(path: string) -> long { return Integer.parseOr(self.head(path).headers.get("Content-Length"), 0); }
+        fn lastModified(path: string) -> long { return Civil.httpDate(self.head(path).headers.get("Last-Modified")); }
+        fn mimeType(path: string) -> string {
+            let t = self.head(path).headers.get("Content-Type");
+            return t == "" ? Mime.forPath(path) : t;
+        }
+
+        fn files(directory: string, recursive: bool) -> Array<string> {
+            let out = new Array<string>();
+            self.list(directory, recursive, out, null);
+            out.sortBy(fn(a, b) => Str.compare(a, b));
+            return out;
+        }
+        fn directories(directory: string) -> Array<string> {
+            let out = new Array<string>();
+            self.list(directory, false, null, out);
+            out.sortBy(fn(a, b) => Str.compare(a, b));
+            return out;
+        }
+        // ListObjectsV2, page by page: keys into `files`, common prefixes (without
+        // their "/") into `dirs`.
+        private fn list(directory: string, recursive: bool, files: Array<string>, dirs: Array<string>) {
+            let d = Disk.clean(directory);
+            let prefix = d == "" ? "" : d + "/";
+            let token = "";
+            while (true) {
+                let q = S3Disk.strings();
+                q.put("list-type", "2");
+                if (prefix != "") { q.put("prefix", prefix); }
+                if (!recursive) { q.put("delimiter", "/"); }
+                if (token != "") { q.put("continuation-token", token); }
+                let res = self.send("GET", "", q, null, "", null);
+                if (res.status != 200) { throw self.fail(res, "listing " + (prefix == "" ? "/" : prefix)); }
+                let xml = res.body();
+                if (files != null) { for (k in S3Disk.blocks(xml, "Contents", "Key")) { files.push(k); } }
+                if (dirs != null) {
+                    for (p in S3Disk.blocks(xml, "CommonPrefixes", "Prefix")) {
+                        dirs.push(Str.endsWith(p, "/") ? p[..p.length - 1] : p);
+                    }
+                }
+                if (S3Disk.tag(xml, "IsTruncated") != "true") { break; }
+                token = S3Disk.tag(xml, "NextContinuationToken");
+                if (token == "") { break; }
+            }
+        }
+        fn deleteDirectory(directory: string) -> bool {
+            let all = self.files(directory, true);
+            for (k in all) {
+                let res = self.send("DELETE", k, S3Disk.none(), null, "", null);
+                if (res.status != 204 && res.status != 200) { throw self.fail(res, "DELETE " + k); }
+            }
+            return all.size() > 0;
+        }
+
+        fn url(path: string) -> string {
+            let key = SigV4.uriEncode(Disk.clean(path), true);
+            if (self.config.publicUrl != "") {
+                let base = self.config.publicUrl;
+                return (Str.endsWith(base, "/") ? base[..base.length - 1] : base) + "/" + key;
+            }
+            return self.scheme + "://" + self.host() + self.pathOf(Disk.clean(path));
+        }
+        // A presigned GET, good for `ttlSeconds` (at most 7 days).
+        fn temporaryUrl(path: string, ttlSeconds: long) -> string {
+            let key = Disk.clean(path);
+            let date = SigV4.amzDate(Time.now());
+            let scope = date[..8] + "/" + self.config.region + "/s3/aws4_request";
+            let q = S3Disk.strings();
+            q.put("X-Amz-Algorithm", "AWS4-HMAC-SHA256");
+            q.put("X-Amz-Credential", self.config.accessKey + "/" + scope);
+            q.put("X-Amz-Date", date);
+            q.put("X-Amz-Expires", str(ttlSeconds < 1 ? 1 : (ttlSeconds > 604800 ? 604800 : ttlSeconds)));
+            q.put("X-Amz-SignedHeaders", "host");
+            if (self.config.sessionToken != "") { q.put("X-Amz-Security-Token", self.config.sessionToken); }
+            let h = S3Disk.strings();
+            h.put("host", self.host());
+            let path0 = self.pathOf(key);
+            let sig = SigV4.signature("GET", path0, q, h, "UNSIGNED-PAYLOAD", self.config.secretKey, self.config.region, "s3", date);
+            let sb = new StringBuilder();
+            sb.append(self.scheme).append("://").append(self.host()).append(path0);
+            let first = true;
+            for ((k, v) in q) {
+                sb.appendChar(first ? 63 : 38).append(SigV4.uriEncode(k, false)).appendChar(61).append(SigV4.uriEncode(v, false));
+                first = false;
+            }
+            return sb.append("&X-Amz-Signature=").append(sig).toString();
+        }
+
+        // ── XML (the few elements S3 replies need) ─────────────────────────────
+        // The text of the first <name>...</name>, entities decoded; "" if none.
+        static fn tag(xml: string, name: string) -> string {
+            let open = "<" + name + ">";
+            let a = Str.indexOf(xml, open);
+            if (a < 0) { return ""; }
+            let b = Str.indexOf(xml[a + open.length..], "</" + name + ">");
+            return b < 0 ? "" : S3Disk.unescape(xml[a + open.length..a + open.length + b]);
+        }
+        // The <inner> text of each <outer> element.
+        static fn blocks(xml: string, outer: string, inner: string) -> Array<string> {
+            let out = new Array<string>();
+            let open = "<" + outer + ">";
+            let close = "</" + outer + ">";
+            let rest = xml;
+            while (true) {
+                let a = Str.indexOf(rest, open);
+                if (a < 0) { break; }
+                let b = Str.indexOf(rest[a..], close);
+                if (b < 0) { break; }
+                out.push(S3Disk.tag(rest[a..a + b], inner));
+                rest = rest[a + b + close.length..];
+            }
+            return out;
+        }
+        private static fn unescape(s: string) -> string {
+            if (!Str.contains(s, "&")) { return s; }
+            return Str.replace(Str.replace(Str.replace(Str.replace(Str.replace(s, "&lt;", "<"), "&gt;", ">"),
+                               "&quot;", "\""), "&apos;", "'"), "&amp;", "&");
+        }
+    }
+}
