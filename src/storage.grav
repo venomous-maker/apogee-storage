@@ -1,0 +1,409 @@
+// storage.grav — files for Apogee apps, one API over several places to keep
+// them: a folder on this machine, an S3-compatible bucket (s3.grav), or memory
+// (tests). Paths are relative and use "/" ("avatars/42.png").
+//
+//   Storage.addDisk("local", new LocalDisk("storage/app", "https://example.com/files", env("APP_KEY")))
+//   Storage.addDisk("s3", new S3Disk(S3Config.aws("my-bucket", "eu-west-1", key, secret)))
+//   Storage.disk("s3").put("avatars/42.png", bytes)
+//   let link = Storage.disk("s3").temporaryUrl("avatars/42.png", 300)   // for five minutes
+//
+//   Storage.fake("s3")          // in a test: an empty memory disk in its place
+import "std"
+import "std/net"
+import "apogee-crypt"
+
+namespace apogee {
+
+    // A file a disk does not have.
+    class FileNotFoundError extends IOError {
+        public path: string
+        constructor(path: string) { super("no such file: '${path}'"); self.path = path; }
+    }
+
+    // A disk's operation failed (permissions, the network, the remote service).
+    class StorageError extends IOError {
+        constructor(message: string) { super(message); }
+    }
+
+    // A place to keep files. A disk implements the core (bytes in and out,
+    // listing, URLs); the rest is built on it here, and a disk may do better.
+    abstract class Disk {
+        // ── the core ───────────────────────────────────────────────────────────
+        // Stores `contents` at `path` (directories are made as needed), replacing a file there.
+        abstract fn putBytes(path: string, contents: Bytes)
+        // The file's bytes; FileNotFoundError when there is none.
+        abstract fn getBytes(path: string) -> Bytes
+        abstract fn exists(path: string) -> bool
+        // Removes it; whether there was one.
+        abstract fn delete(path: string) -> bool
+        // FileNotFoundError when `from` is missing.
+        abstract fn copy(from: string, to: string)
+        // Bytes; FileNotFoundError when missing.
+        abstract fn size(path: string) -> long
+        // Unix seconds; FileNotFoundError when missing.
+        abstract fn lastModified(path: string) -> long
+        // The files in `directory` ("" for the top), as paths from the top of the
+        // disk, sorted; with `recursive`, the files below it too.
+        abstract fn files(directory: string, recursive: bool) -> Array<string>
+        // The directories directly in `directory`, as paths from the top, sorted.
+        abstract fn directories(directory: string) -> Array<string>
+        // Removes everything under `directory`; whether there was anything.
+        abstract fn deleteDirectory(directory: string) -> bool
+        // Where a browser gets the file (the disk's public URL for it).
+        abstract fn url(path: string) -> string
+        // A URL that works for `ttlSeconds`, for files that are not public.
+        abstract fn temporaryUrl(path: string, ttlSeconds: long) -> string
+
+        // ── built on the core ──────────────────────────────────────────────────
+        fn put(path: string, contents: string) { self.putBytes(path, Bytes.fromString(contents)); }
+        fn get(path: string) -> string { return self.getBytes(path).toString(); }
+        // The file's text, or `fallback` when it is missing.
+        fn getOr(path: string, fallback: string) -> string { return self.exists(path) ? self.get(path) : fallback; }
+        fn missing(path: string) -> bool { return !self.exists(path); }
+        // Stores a file from this machine.
+        fn putFile(path: string, localFile: string) {
+            let f = new File(localFile);
+            if (!f.exists()) { throw new FileNotFoundError(localFile); }
+            self.putBytes(path, Bytes.fromBinary(f.readBinary()));
+        }
+        // Writes the file to `localFile` on this machine.
+        fn download(path: string, localFile: string) {
+            let dir = Path.dirname(localFile);
+            if (dir != "" && dir != ".") { Dir.create(dir); }
+            if (!new File(localFile).writeBinary(self.getBytes(path).toBinary())) {
+                throw new StorageError("cannot write '${localFile}'");
+            }
+        }
+        fn move(from: string, to: string) {
+            self.copy(from, to);
+            self.delete(from);
+        }
+        // Adds `text` to the end (a missing file starts empty).
+        fn append(path: string, text: string) {
+            let b = self.exists(path) ? self.getBytes(path) : new Bytes();
+            self.putBytes(path, b.appendString(text));
+        }
+        // Adds `text` to the start (a missing file starts empty).
+        fn prepend(path: string, text: string) {
+            let b = Bytes.fromString(text);
+            if (self.exists(path)) { b.append(self.getBytes(path)); }
+            self.putBytes(path, b);
+        }
+        // Removes each; how many there were.
+        fn deleteMany(paths: Array<string>) -> int {
+            let n = 0;
+            for (p in paths) { if (self.delete(p)) { n += 1; } }
+            return n;
+        }
+        fn allFiles(directory: string = "") -> Array<string> { return self.files(directory, true); }
+        // The MIME type its extension stands for ("application/octet-stream" if unknown).
+        fn mimeType(path: string) -> string { return Mime.forPath(path); }
+
+        // ── paths ──────────────────────────────────────────────────────────────
+        // A path as the disks keep it: no leading or trailing "/", no "." or empty
+        // segments; ValueError for ".." (no way out of the disk).
+        static fn clean(path: string) -> string {
+            let out = new Array<string>();
+            for (seg in Str.split(Str.replace(path, "\\", "/"), "/")) {
+                if (seg == "" || seg == ".") { continue; }
+                if (seg == "..") { throw new ValueError("a storage path cannot go up with '..': '${path}'"); }
+                out.push(seg);
+            }
+            return Str.join(out, "/");
+        }
+    }
+
+    // MIME types by extension, for the common kinds of files apps store.
+    class Mime {
+        static fn forPath(path: string) -> string {
+            let ext = Str.lower(Path.extension(path));
+            if (Str.startsWith(ext, ".")) { ext = ext[1..]; }
+            switch (ext) {
+                case "png": return "image/png"
+                case "jpg", "jpeg": return "image/jpeg"
+                case "gif": return "image/gif"
+                case "webp": return "image/webp"
+                case "svg": return "image/svg+xml"
+                case "ico": return "image/x-icon"
+                case "avif": return "image/avif"
+                case "pdf": return "application/pdf"
+                case "json": return "application/json"
+                case "xml": return "application/xml"
+                case "zip": return "application/zip"
+                case "gz": return "application/gzip"
+                case "txt", "log": return "text/plain"
+                case "csv": return "text/csv"
+                case "html", "htm": return "text/html"
+                case "css": return "text/css"
+                case "js", "mjs": return "text/javascript"
+                case "md": return "text/markdown"
+                case "mp3": return "audio/mpeg"
+                case "wav": return "audio/wav"
+                case "ogg": return "audio/ogg"
+                case "mp4": return "video/mp4"
+                case "webm": return "video/webm"
+                case "woff": return "font/woff"
+                case "woff2": return "font/woff2"
+                default: return "application/octet-stream"
+            }
+        }
+    }
+
+    // Files in memory: for tests (Storage.fake) and scratch data. Thread-safe.
+    class MemoryDisk extends Disk {
+        private files: SortedMap<string, Bytes>
+        private times: HashMap<string, long>
+        private lock: Mutex
+        public baseUrl: string
+        constructor(baseUrl: string = "memory://") {
+            self.files = new SortedMap<string, Bytes>(fn(a: string, b: string) => Str.compare(a, b));
+            self.times = new HashMap<string, long>();
+            self.lock = new Mutex();
+            self.baseUrl = baseUrl;
+        }
+        fn putBytes(path: string, contents: Bytes) {
+            let p = Disk.clean(path);
+            self.lock.lock();
+            self.files.put(p, contents.copy());
+            self.times.put(p, Time.now());
+            self.lock.unlock();
+        }
+        fn getBytes(path: string) -> Bytes {
+            let p = Disk.clean(path);
+            self.lock.lock();
+            let b = self.files.getOr(p, null);
+            self.lock.unlock();
+            if (b == null) { throw new FileNotFoundError(p); }
+            return b.copy();
+        }
+        fn exists(path: string) -> bool {
+            let p = Disk.clean(path);
+            self.lock.lock();
+            let has = self.files.containsKey(p);
+            self.lock.unlock();
+            return has;
+        }
+        fn delete(path: string) -> bool {
+            let p = Disk.clean(path);
+            self.lock.lock();
+            let had = self.files.containsKey(p);
+            self.files.remove(p);
+            self.times.remove(p);
+            self.lock.unlock();
+            return had;
+        }
+        fn copy(from: string, to: string) { self.putBytes(to, self.getBytes(from)); }
+        fn size(path: string) -> long { return self.getBytes(path).size() as long; }
+        fn lastModified(path: string) -> long {
+            let p = Disk.clean(path);
+            if (!self.exists(p)) { throw new FileNotFoundError(p); }
+            self.lock.lock();
+            let t = self.times.getOr(p, 0);
+            self.lock.unlock();
+            return t;
+        }
+        fn files(directory: string, recursive: bool) -> Array<string> {
+            let prefix = MemoryDisk.prefixOf(directory);
+            let out = new Array<string>();
+            self.lock.lock();
+            for ((p, _) in self.files) {
+                if (!Str.startsWith(p, prefix)) { continue; }
+                if (recursive || !Str.contains(p[prefix.length..], "/")) { out.push(p); }
+            }
+            self.lock.unlock();
+            return out;
+        }
+        fn directories(directory: string) -> Array<string> {
+            let prefix = MemoryDisk.prefixOf(directory);
+            let seen = new SortedMap<string, bool>(fn(a: string, b: string) => Str.compare(a, b));
+            self.lock.lock();
+            for ((p, _) in self.files) {
+                if (!Str.startsWith(p, prefix)) { continue; }
+                let rest = p[prefix.length..];
+                let slash = Str.indexOf(rest, "/");
+                if (slash > 0) { seen.put(prefix + rest[..slash], true); }
+            }
+            self.lock.unlock();
+            let out = new Array<string>();
+            for ((d, _) in seen) { out.push(d); }
+            return out;
+        }
+        fn deleteDirectory(directory: string) -> bool {
+            let gone = self.files(directory, true);
+            for (p in gone) { self.delete(p); }
+            return gone.size() > 0;
+        }
+        fn url(path: string) -> string { return self.baseUrl + Disk.clean(path); }
+        fn temporaryUrl(path: string, ttlSeconds: long) -> string {
+            return self.url(path) + "?expires=" + str(Time.now() + ttlSeconds);
+        }
+        private static fn prefixOf(directory: string) -> string {
+            let d = Disk.clean(directory);
+            return d == "" ? "" : d + "/";
+        }
+    }
+
+    // Files in a folder on this machine. Public URLs are `baseUrl` + the path;
+    // temporary URLs are signed with `signingKey` (apogee-crypt's MessageSigner),
+    // and the route that serves them checks them with verifyTemporaryUrl().
+    class LocalDisk extends Disk {
+        public root: string
+        public baseUrl: string
+        private signer: MessageSigner
+        constructor(root: string, baseUrl: string = "", signingKey: string = "") {
+            self.root = Str.endsWith(root, "/") && root.length > 1 ? root[..root.length - 1] : root;
+            self.baseUrl = Str.endsWith(baseUrl, "/") ? baseUrl[..baseUrl.length - 1] : baseUrl;
+            self.signer = signingKey == "" ? null : new MessageSigner(signingKey);
+            Dir.create(self.root);
+        }
+        // The file's place on this machine.
+        fn fullPath(path: string) -> string {
+            let p = Disk.clean(path);
+            return p == "" ? self.root : self.root + "/" + p;
+        }
+        fn putBytes(path: string, contents: Bytes) {
+            let full = self.fullPath(path);
+            Dir.create(Path.dirname(full));
+            // Written beside it, then renamed over it: a reader never sees half a file.
+            let tmp = full + ".tmp" + str(Process.pid()) + "_" + str(LocalDisk.counter.increment());
+            if (!new File(tmp).writeBinary(contents.toBinary())) { throw new StorageError("cannot write '${full}'"); }
+            if (!new File(tmp).moveTo(full)) {
+                new File(tmp).delete();
+                throw new StorageError("cannot write '${full}'");
+            }
+        }
+        private static counter: AtomicInt = new AtomicInt(0)
+        fn getBytes(path: string) -> Bytes {
+            let f = new File(self.fullPath(path));
+            if (!f.exists()) { throw new FileNotFoundError(Disk.clean(path)); }
+            return Bytes.fromBinary(f.readBinary());
+        }
+        fn exists(path: string) -> bool { return new File(self.fullPath(path)).exists(); }
+        fn delete(path: string) -> bool {
+            let f = new File(self.fullPath(path));
+            return f.exists() && f.delete();
+        }
+        fn copy(from: string, to: string) {
+            let src = new File(self.fullPath(from));
+            if (!src.exists()) { throw new FileNotFoundError(Disk.clean(from)); }
+            let dest = self.fullPath(to);
+            Dir.create(Path.dirname(dest));
+            if (!src.copyTo(dest)) { throw new StorageError("cannot copy to '${dest}'"); }
+        }
+        fn move(from: string, to: string) {
+            let src = new File(self.fullPath(from));
+            if (!src.exists()) { throw new FileNotFoundError(Disk.clean(from)); }
+            let dest = self.fullPath(to);
+            Dir.create(Path.dirname(dest));
+            if (!src.moveTo(dest)) { super.move(from, to); }   // (another file system: copy and delete)
+        }
+        fn size(path: string) -> long {
+            let f = new File(self.fullPath(path));
+            if (!f.exists()) { throw new FileNotFoundError(Disk.clean(path)); }
+            return f.size();
+        }
+        fn lastModified(path: string) -> long {
+            let f = new File(self.fullPath(path));
+            if (!f.exists()) { throw new FileNotFoundError(Disk.clean(path)); }
+            return f.modified();
+        }
+        fn files(directory: string, recursive: bool) -> Array<string> {
+            let base = self.fullPath(directory);
+            let out = new Array<string>();
+            if (!Dir.exists(base)) { return out; }
+            let cut = self.root.length + 1;
+            if (recursive) {
+                for (p in Dir.walk(base)) { if (!LocalDisk.isTemp(p)) { out.push(p[cut..]); } }
+            } else {
+                for (name in Dir.list(base)) {
+                    let p = base + "/" + name;
+                    if (Dir.isFile(p) && !LocalDisk.isTemp(p)) { out.push(p[cut..]); }
+                }
+            }
+            return out;
+        }
+        fn directories(directory: string) -> Array<string> {
+            let base = self.fullPath(directory);
+            let out = new Array<string>();
+            for (name in Dir.list(base)) {
+                let p = base + "/" + name;
+                if (Dir.exists(p)) { out.push(p[self.root.length + 1..]); }
+            }
+            return out;
+        }
+        fn deleteDirectory(directory: string) -> bool {
+            let base = self.fullPath(directory);
+            if (base == self.root || !Dir.exists(base)) { return false; }
+            return Dir.removeAll(base);
+        }
+        fn url(path: string) -> string {
+            if (self.baseUrl == "") { throw new StateError("this local disk has no base URL"); }
+            return self.baseUrl + "/" + LocalDisk.encodePath(Disk.clean(path));
+        }
+        // `url(path)` with `?expires=<unix>&signature=<...>`: needs a signing key.
+        fn temporaryUrl(path: string, ttlSeconds: long) -> string {
+            if (self.signer == null) { throw new StateError("this local disk has no signing key for temporary URLs"); }
+            let p = Disk.clean(path);
+            let expires = Time.now() + ttlSeconds;
+            return self.url(p) + "?expires=" + str(expires) + "&signature=" + Url.encode(self.signer.sign(p + "|" + str(expires), "storage-url"));
+        }
+        // Whether the `expires` and `signature` a temporary URL for `path` came with
+        // are genuine and not past.
+        fn verifyTemporaryUrl(path: string, expires: string, signature: string) -> bool {
+            if (self.signer == null) { return false; }
+            let when = Integer.parseOr(expires, 0);
+            if (when < Time.now()) { return false; }
+            try { return self.signer.unsign(signature, "storage-url") == Disk.clean(path) + "|" + expires; }
+            catch (e: InvalidSignature) { return false; }
+        }
+        private static fn isTemp(p: string) -> bool { return Str.contains(Path.basename(p), ".tmp") && Str.contains(p, "_"); }
+        // Each segment percent-encoded, the slashes kept.
+        static fn encodePath(p: string) -> string {
+            let segs = new Array<string>();
+            for (s in Str.split(p, "/")) { segs.push(Url.encode(s)); }
+            return Str.join(segs, "/");
+        }
+    }
+
+    // The app's disks, by name. The first one added is the default.
+    class Storage {
+        private static disks: HashMap<string, Disk> = new HashMap<string, Disk>()
+        private static defaultName: string = ""
+        private static lock: Mutex = new Mutex()
+
+        static fn addDisk(name: string, disk: Disk) {
+            Storage.lock.lock();
+            Storage.disks.put(name, disk);
+            if (Storage.defaultName == "") { Storage.defaultName = name; }
+            Storage.lock.unlock();
+        }
+        static fn setDefault(name: string) { Storage.defaultName = name; }
+        // The disk called `name` ("" for the default); StateError for an unknown one.
+        static fn disk(name: string = "") -> Disk {
+            Storage.lock.lock();
+            let n = name == "" ? Storage.defaultName : name;
+            let d = Storage.disks.getOr(n, null);
+            Storage.lock.unlock();
+            if (d == null) { throw new StateError(n == "" ? "no storage disks: Storage.addDisk(...) first" : "no storage disk called '${n}'"); }
+            return d;
+        }
+        static fn has(name: string) -> bool { return Storage.disks.containsKey(name); }
+        // In a test: an empty memory disk in place of `name` (the default when ""),
+        // which it returns so the test can look at it.
+        static fn fake(name: string = "") -> MemoryDisk {
+            let fake = new MemoryDisk("memory://" + (name == "" ? Storage.defaultName : name) + "/");
+            Storage.lock.lock();
+            let n = name == "" ? (Storage.defaultName == "" ? "local" : Storage.defaultName) : name;
+            Storage.disks.put(n, fake);
+            if (Storage.defaultName == "") { Storage.defaultName = n; }
+            Storage.lock.unlock();
+            return fake;
+        }
+        // The default disk's operations, as statics.
+        static fn put(path: string, contents: string) { Storage.disk().put(path, contents); }
+        static fn get(path: string) -> string { return Storage.disk().get(path); }
+        static fn exists(path: string) -> bool { return Storage.disk().exists(path); }
+        static fn delete(path: string) -> bool { return Storage.disk().delete(path); }
+        static fn url(path: string) -> string { return Storage.disk().url(path); }
+    }
+}
