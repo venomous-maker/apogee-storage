@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.0 (2026-11-20)
+
 The first release. Needs grav 1.10.0 or newer.
 
 - `Disk`, with the memory, local and S3 disks, and the `Storage` facade with a
