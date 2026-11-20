@@ -1,0 +1,81 @@
+// apogee-storage's S3 tests: they need an S3-compatible server that checks
+// signatures. S3_ENDPOINT, S3_KEY and S3_SECRET say where and as whom
+// (defaults: a local SeaweedFS, see README.md); each run uses a fresh bucket.
+import "std"
+import "std/net"
+import "../src/all.grav"
+use apogee.*
+
+fn setting(name: string, fallback: string) -> string {
+    let v = env(name)
+    return v == "" ? fallback : v
+}
+
+fn disk() -> S3Disk {
+    let cfg = S3Config.compatible(setting("S3_ENDPOINT", "http://127.0.0.1:8333"),
+                                  "apogee-test-" + str(Process.pid()) + "-" + str(Time.nowMs() % 100000),
+                                  setting("S3_KEY", "AKIDGRAVTEST"), setting("S3_SECRET", "gravSecretKeyForTests123"))
+    let d = new S3Disk(cfg)
+    d.createBucket()
+    return d
+}
+
+test "objects in, out, listed, copied and removed" {
+    let d = disk()
+    d.put("a.txt", "alpha")
+    d.put("docs/b.txt", "beta")
+    d.put("docs/deep/c.txt", "gamma")
+    d.put("with space/ü & co.txt", "odd name")
+    assertEq(d.get("a.txt"), "alpha")
+    assertEq(d.get("with space/ü & co.txt"), "odd name")
+    assert(d.exists("docs/b.txt"))
+    assert(d.missing("nope.txt"))
+    assertEq(d.size("docs/deep/c.txt"), 5 as long)
+    assert(d.lastModified("a.txt") > 1700000000)
+    assertEq(d.mimeType("a.txt"), "text/plain")
+    assertEq(Str.join(d.files("", false), ","), "a.txt")
+    assertEq(Str.join(d.files("docs", false), ","), "docs/b.txt")
+    assertEq(Str.join(d.allFiles(), ","), "a.txt,docs/b.txt,docs/deep/c.txt,with space/ü & co.txt")
+    assertEq(Str.join(d.directories(""), ","), "docs,with space")
+    d.copy("a.txt", "copies/a.txt")
+    d.move("docs/b.txt", "moved/b.txt")
+    assert(d.missing("docs/b.txt"))
+    assertEq(d.get("moved/b.txt"), "beta")
+    let bin = Bytes.fromHex("00ff10ab00")
+    d.putBytes("bin/x.bin", bin)
+    assertEq(d.getBytes("bin/x.bin").toHex(), "00ff10ab00")
+    let missing = false
+    try { d.get("nope.txt") } catch (e: FileNotFoundError) { missing = true }
+    assert(missing)
+    assert(d.delete("a.txt"))
+    assert(!d.delete("a.txt"))
+    assert(d.deleteDirectory(""))
+    assertEq(d.allFiles().size(), 0)
+}
+
+test "many objects list across pages" {
+    let d = disk()
+    for (i in 0..1005) { d.put("many/" + Str.padLeft(str(i), 4, "0") + ".txt", "x") }
+    let all = d.files("many", false)
+    assertEq(all.size(), 1005)
+    assertEq(all[1004], "many/1004.txt")
+    d.deleteDirectory("many")
+}
+
+test "a presigned URL works without credentials, and a wrong key is refused" {
+    let d = disk()
+    d.put("private/report.txt", "secret report")
+    let link = d.temporaryUrl("private/report.txt", 60)
+    assert(Str.contains(link, "X-Amz-Signature="))
+    let res = new HttpClient().get(link)
+    assertEq(res.status, 200)
+    assertEq(res.body(), "secret report")
+    let plain = new HttpClient().get(d.url("private/report.txt"))
+    assert(plain.status == 403 || plain.status == 401)       // not public
+    let cfg = d.config
+    let wrong = new S3Disk(new S3Config(cfg.bucket, cfg.region, cfg.accessKey, "not-the-secret", cfg.endpoint, true))
+    let refused = false
+    try { wrong.get("private/report.txt") } catch (e: StorageError) { refused = true }
+    assert(refused)
+    d.deleteDirectory("")
+}
