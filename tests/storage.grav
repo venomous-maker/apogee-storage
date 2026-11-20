@@ -1,0 +1,149 @@
+// apogee-storage's tests that need nothing running: paths, MIME types, the
+// memory and local disks, temporary URLs, the facade and its fake, and
+// Signature V4 against AWS's published example. (tests/s3.grav needs a
+// server.)
+import "std"
+import "../src/all.grav"
+use apogee.*
+
+const KEY: string = "base64:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
+fn scratch(name: string) -> string {
+    let d = Dir.temp() + "/apogee_storage_test_" + str(Process.pid()) + "_" + name
+    Dir.removeAll(d)
+    return d
+}
+
+// The same checks for every disk.
+fn exercise(d: Disk) {
+    d.put("a.txt", "alpha")
+    d.put("docs/b.txt", "beta")
+    d.put("docs/deep/c.txt", "gamma")
+    assertEq(d.get("a.txt"), "alpha")
+    assert(d.exists("docs/b.txt"))
+    assert(d.missing("nope.txt"))
+    assertEq(d.size("docs/deep/c.txt"), 5 as long)
+    assert(d.lastModified("a.txt") > 1700000000)
+    assertEq(Str.join(d.files("", false), ","), "a.txt")
+    assertEq(Str.join(d.files("docs", false), ","), "docs/b.txt")
+    assertEq(Str.join(d.allFiles(), ","), "a.txt,docs/b.txt,docs/deep/c.txt")
+    assertEq(Str.join(d.directories(""), ","), "docs")
+    assertEq(Str.join(d.directories("docs"), ","), "docs/deep")
+    d.copy("a.txt", "copies/a.txt")
+    d.move("docs/b.txt", "moved/b.txt")
+    assert(d.missing("docs/b.txt"))
+    assertEq(d.get("moved/b.txt"), "beta")
+    d.append("log.txt", "one\n")
+    d.append("log.txt", "two\n")
+    d.prepend("log.txt", "zero\n")
+    assertEq(d.get("log.txt"), "zero\none\ntwo\n")
+    let bin = Bytes.fromHex("00ff10ab00")
+    d.putBytes("bin/x.bin", bin)
+    assertEq(d.getBytes("bin/x.bin").toHex(), "00ff10ab00")
+    assertEq(d.getOr("nope.txt", "fallback"), "fallback")
+    let missing = false
+    try { d.get("nope.txt") } catch (e: FileNotFoundError) { missing = e.path == "nope.txt" }
+    assert(missing)
+    assert(d.delete("a.txt"))
+    assert(!d.delete("a.txt"))
+    assertEq(d.deleteMany(["copies/a.txt", "nope", "log.txt"]), 2)
+    assert(d.deleteDirectory("docs"))
+    assert(d.missing("docs/deep/c.txt"))
+    assertEq(d.mimeType("pic.PNG"), "image/png")
+}
+
+test "paths are cleaned, and cannot leave the disk" {
+    assertEq(Disk.clean("/a//b/./c/"), "a/b/c")
+    assertEq(Disk.clean("a\\b"), "a/b")
+    let escaped = false
+    try { Disk.clean("a/../../etc/passwd") } catch (e: ValueError) { escaped = true }
+    assert(escaped)
+    assertEq(Mime.forPath("x/report.pdf"), "application/pdf")
+    assertEq(Mime.forPath("noext"), "application/octet-stream")
+}
+
+test "the memory disk" {
+    exercise(new MemoryDisk())
+}
+
+test "the local disk" {
+    let root = scratch("local")
+    let d = new LocalDisk(root, "https://files.example.com/", KEY)
+    exercise(d)
+    assert(Dir.exists(root))
+    d.put("with space/ü.txt", "x")
+    assert(new File(root + "/with space/ü.txt").exists())
+    assertEq(d.url("with space/ü.txt"), "https://files.example.com/with%20space/%C3%BC.txt")
+    // a file from this machine in, and back out
+    let src = root + "_src.txt"
+    new File(src).write("from disk")
+    d.putFile("uploads/in.txt", src)
+    d.download("uploads/in.txt", root + "_out/got.txt")
+    assertEq(new File(root + "_out/got.txt").read(), "from disk")
+    Dir.removeAll(root)
+    Dir.removeAll(root + "_out")
+    new File(src).delete()
+}
+
+fn queryParam(url: string, name: string) -> string {
+    let at = Str.indexOf(url, name + "=")
+    if (at < 0) { return "" }
+    let rest = url[at + name.length + 1..]
+    let amp = Str.indexOf(rest, "&")
+    return Url.decode(amp < 0 ? rest : rest[..amp])
+}
+
+test "local temporary URLs are signed and expire" {
+    let d = new LocalDisk(scratch("tmpurl"), "https://files.example.com", KEY)
+    let link = d.temporaryUrl("private/report.pdf", 60)
+    assert(Str.startsWith(link, "https://files.example.com/private/report.pdf?expires="))
+    let exp = queryParam(link, "expires")
+    let sig = queryParam(link, "signature")
+    assert(d.verifyTemporaryUrl("private/report.pdf", exp, sig))
+    assert(!d.verifyTemporaryUrl("private/other.pdf", exp, sig))
+    assert(!d.verifyTemporaryUrl("private/report.pdf", str(Integer.parseOr(exp, 0) + 100), sig))
+    assert(!d.verifyTemporaryUrl("private/report.pdf", "1000", sig))
+    let noKey = false
+    try { new LocalDisk(scratch("nokey"), "https://x").temporaryUrl("a", 5) } catch (e: StateError) { noKey = true }
+    assert(noKey)
+}
+
+test "the Storage facade, and faking a disk" {
+    Storage.addDisk("mem", new MemoryDisk())
+    Storage.put("hello.txt", "hi")
+    assertEq(Storage.get("hello.txt"), "hi")
+    assertEq(Storage.disk("mem").get("hello.txt"), "hi")
+    let fake = Storage.fake("mem")
+    assert(!Storage.exists("hello.txt"))          // the fake starts empty
+    Storage.disk("mem").put("avatars/1.png", "png")
+    assert(fake.exists("avatars/1.png"))
+    let unknown = false
+    try { Storage.disk("nowhere") } catch (e: StateError) { unknown = true }
+    assert(unknown)
+}
+
+test "Signature V4 matches AWS's example" {
+    // docs.aws.amazon.com/general/latest/gr/sigv4-calculate-signature.html (IAM ListUsers)
+    let q = S3Disk.strings()
+    q.put("Action", "ListUsers")
+    q.put("Version", "2010-05-08")
+    let h = S3Disk.strings()
+    h.put("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+    h.put("host", "iam.amazonaws.com")
+    h.put("x-amz-date", "20150830T123600Z")
+    let sig = SigV4.signature("GET", "/", q, h, Hash.sha256(""), "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                              "us-east-1", "iam", "20150830T123600Z")
+    assertEq(sig, "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7")
+    assertEq(SigV4.amzDate(1440938160), "20150830T123600Z")
+    assertEq(SigV4.uriEncode("a b/ü~", true), "a%20b/%C3%BC~")
+    assertEq(SigV4.uriEncode("a/b", false), "a%2Fb")
+}
+
+test "calendar days and HTTP dates" {
+    assertEq(Civil.toDays(1970, 1, 1), 0 as long)
+    assertEq(Civil.toDays(2000, 3, 1), 11017 as long)
+    let ymd = Civil.fromDays(20412)
+    assertEq("${ymd[0]}-${ymd[1]}-${ymd[2]}", "2025-11-20")
+    assertEq(Civil.httpDate("Sun, 30 Aug 2015 12:36:00 GMT"), 1440938160 as long)
+    assertEq(Civil.httpDate("garbage"), 0 as long)
+}
