@@ -6,6 +6,9 @@ compiler versions it builds with.
 
 ## Unreleased
 
+- The S3 date helper is `S3Dates` (it was `Civil`, which apogee-support also
+  defines, so the two could not be in one program).
+
 ## 0.1.1 (2026-11-21)
 
 ### Performance
