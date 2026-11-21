@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.1 (2026-11-21)
+
 ### Performance
 
 - An S3 disk keeps a small pool of keep-alive HTTP clients instead of one
