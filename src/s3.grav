@@ -121,16 +121,16 @@ namespace apogee {
         static fn amzDate(unix: long) -> string {
             let days = unix / 86400;
             let secs = unix % 86400;
-            let ymd = Civil.fromDays(days);
-            return Civil.pad(ymd[0], 4) + Civil.pad(ymd[1], 2) + Civil.pad(ymd[2], 2) + "T" +
-                   Civil.pad((secs / 3600) as int, 2) + Civil.pad(((secs / 60) % 60) as int, 2) +
-                   Civil.pad((secs % 60) as int, 2) + "Z";
+            let ymd = S3Dates.fromDays(days);
+            return S3Dates.pad(ymd[0], 4) + S3Dates.pad(ymd[1], 2) + S3Dates.pad(ymd[2], 2) + "T" +
+                   S3Dates.pad((secs / 3600) as int, 2) + S3Dates.pad(((secs / 60) % 60) as int, 2) +
+                   S3Dates.pad((secs % 60) as int, 2) + "Z";
         }
     }
 
     // Calendar dates and days since 1970-01-01 (UTC), both ways (H. Hinnant's
     // civil-from-days algorithms).
-    class Civil {
+    class S3Dates {
         static fn fromDays(z0: long) -> int[3] {
             let z = z0 + 719468;
             let era = (z >= 0 ? z : z - 146096) / 146097;
@@ -162,7 +162,7 @@ namespace apogee {
             let m = months.indexOf(p[2]) + 1;
             let t = Str.split(p[4], ":");
             if (m == 0 || t.size() != 3) { return 0; }
-            let days = Civil.toDays(Integer.parseOr(p[3], 1970) as int, m, Integer.parseOr(p[1], 1) as int);
+            let days = S3Dates.toDays(Integer.parseOr(p[3], 1970) as int, m, Integer.parseOr(p[1], 1) as int);
             return days * 86400 + Integer.parseOr(t[0], 0) * 3600 + Integer.parseOr(t[1], 0) * 60 + Integer.parseOr(t[2], 0);
         }
     }
@@ -300,7 +300,7 @@ namespace apogee {
             if (res.status != 200 || Str.contains(res.body(), "<Error>")) { throw self.fail(res, "copying " + src); }
         }
         fn size(path: string) -> long { return Integer.parseOr(self.head(path).headers.get("Content-Length"), 0); }
-        fn lastModified(path: string) -> long { return Civil.httpDate(self.head(path).headers.get("Last-Modified")); }
+        fn lastModified(path: string) -> long { return S3Dates.httpDate(self.head(path).headers.get("Last-Modified")); }
         fn mimeType(path: string) -> string {
             let t = self.head(path).headers.get("Content-Type");
             return t == "" ? Mime.forPath(path) : t;

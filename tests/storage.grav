@@ -140,10 +140,10 @@ test "Signature V4 matches AWS's example" {
 }
 
 test "calendar days and HTTP dates" {
-    assertEq(Civil.toDays(1970, 1, 1), 0 as long)
-    assertEq(Civil.toDays(2000, 3, 1), 11017 as long)
-    let ymd = Civil.fromDays(20412)
+    assertEq(S3Dates.toDays(1970, 1, 1), 0 as long)
+    assertEq(S3Dates.toDays(2000, 3, 1), 11017 as long)
+    let ymd = S3Dates.fromDays(20412)
     assertEq("${ymd[0]}-${ymd[1]}-${ymd[2]}", "2025-11-20")
-    assertEq(Civil.httpDate("Sun, 30 Aug 2015 12:36:00 GMT"), 1440938160 as long)
-    assertEq(Civil.httpDate("garbage"), 0 as long)
+    assertEq(S3Dates.httpDate("Sun, 30 Aug 2015 12:36:00 GMT"), 1440938160 as long)
+    assertEq(S3Dates.httpDate("garbage"), 0 as long)
 }
