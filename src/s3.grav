@@ -170,15 +170,16 @@ namespace apogee {
     // A disk in an S3 bucket.
     class S3Disk extends Disk {
         public config: S3Config
-        private client: HttpClient
+        // Keep-alive HTTP clients not in use: a request takes one (or makes one) and
+        // gives it back, so requests from several threads run side by side.
+        private idle: Array<HttpClient>
         private lock: Mutex
         private scheme: string
         private hostPort: string     // the endpoint's host[:port]
 
         constructor(config: S3Config) {
             self.config = config;
-            self.client = new HttpClient();
-            self.client.timeoutMs = 30000;
+            self.idle = new Array<HttpClient>();
             self.lock = new Mutex();
             let e = config.endpoint;
             let at = Str.indexOf(e, "://");
@@ -217,16 +218,27 @@ namespace apogee {
                 qs.appendChar(qs.length() == 0 ? 63 : 38).append(SigV4.uriEncode(k, false)).appendChar(61).append(SigV4.uriEncode(v, false));
             }
             let url = self.scheme + "://" + self.host() + path + qs.toString();
-            self.lock.lock();
+            let client = self.take();
             try {
-                let res = self.client.send(method, url, method == "GET" || method == "HEAD" || method == "DELETE" ? null : payload,
-                                           contentType, headers);
-                self.lock.unlock();
+                let res = client.send(method, url, method == "GET" || method == "HEAD" || method == "DELETE" ? null : payload,
+                                      contentType, headers);
+                self.giveBack(client);
                 return res;
             } catch (e: Exception) {
-                self.lock.unlock();
-                throw new StorageError("S3 ${method} ${path}: " + e.message());
+                throw new StorageError("S3 ${method} ${path}: " + e.message());   // (that client is dropped)
             }
+        }
+        private fn take() -> HttpClient {
+            self.lock.lock();
+            let c = self.idle.isEmpty() ? null : self.idle.pop();
+            self.lock.unlock();
+            if (c == null) { c = new HttpClient(); c.timeoutMs = 30000; }
+            return c;
+        }
+        private fn giveBack(c: HttpClient) {
+            self.lock.lock();
+            if (self.idle.size() < 16) { self.idle.push(c); }
+            self.lock.unlock();
         }
         private fn fail(res: HttpResponse, what: string) -> StorageError {
             let body = res.body();
