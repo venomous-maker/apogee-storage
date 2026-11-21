@@ -6,6 +6,13 @@ compiler versions it builds with.
 
 ## Unreleased
 
+### Performance
+
+- An S3 disk keeps a small pool of keep-alive HTTP clients instead of one
+  behind a lock, so requests from several threads run side by side: 320
+  uploads from 8 threads against a server with 20 ms of latency took 0.8 s
+  instead of 6.5 s.
+
 ## 0.1.0 (2026-11-20)
 
 The first release. Needs grav 1.10.0 or newer.
