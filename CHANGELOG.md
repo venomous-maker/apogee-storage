@@ -11,6 +11,10 @@ Needs grav 1.12.0 or newer.
 - `StoragePackage`: the module connects itself to an apogee-framework app (apogee-package):
   its settings, wiring moved here from the framework.
 
+### Dependencies
+
+- Uses apogee-package 0.1.0, apogee-crypt 0.2.0 (from their GitHub tags).
+
 ## 0.1.2 (2026-11-21)
 
 - The S3 date helper is `S3Dates` (it was `Civil`, which apogee-support also

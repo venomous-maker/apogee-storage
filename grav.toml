@@ -4,6 +4,6 @@ grav = ">=1.12.0"
 paths = ["src"]
 
 [dependencies]
-apogee-package = { path = "/home/venom/CLionProjects/Practice/apogee-package" }
+apogee-package = "github.com/venomous-maker/apogee-package@v0.1.0"
 apogee-config = "github.com/venomous-maker/apogee-config@v0.2.0"
-apogee-crypt = "github.com/venomous-maker/apogee-crypt@v0.1.0"
+apogee-crypt = "github.com/venomous-maker/apogee-crypt@v0.2.0"
