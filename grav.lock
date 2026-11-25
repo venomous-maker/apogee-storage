@@ -1,11 +1,12 @@
 # grav.lock: exact commits of the installed dependencies (generated; commit this file)
-apogee-crypt = { source = "github.com/venomous-maker/apogee-crypt", version = "v0.1.0", commit = "294365f614f8eb114c1a2dc68eddcc11f5d519e0" }
-apogee-http = { source = "github.com/venomous-maker/apogee-http", version = "v0.2.0", commit = "16ba7122a6371e3f6b4c01f4eb63632ea5d6a061" }
-apogee-routing = { source = "github.com/venomous-maker/apogee-routing", version = "v0.2.0", commit = "4539318d0ed9b7e7e41805bbdfa945ecbd4a62a7" }
-apogee-auth = { source = "github.com/venomous-maker/apogee-auth", version = "v0.2.1", commit = "83cc21495223a4a838aa5f8b303276823b839b32" }
-apogee-session = { source = "github.com/venomous-maker/apogee-session", version = "v0.2.1", commit = "eeda4de3c81dcbcc31e5ad078fd8f0a7e372f6ce" }
-apogee-validation = { source = "github.com/venomous-maker/apogee-validation", version = "v0.2.0", commit = "c0c0c49f4d7f4ad3efeca32faedb3325ebee253e" }
+apogee-package = { source = "github.com/venomous-maker/apogee-package", version = "v0.1.0", commit = "dd3a8bface4f15f2d4a6e4965ef8bf4724503553" }
+apogee-http = { source = "github.com/venomous-maker/apogee-http", version = "v0.3.0", commit = "c094f1debc4ca1f71343f77ed80174e06ac47254" }
+apogee-routing = { source = "github.com/venomous-maker/apogee-routing", version = "v0.3.0", commit = "e88127e9b666c317d39d6b26ce01ae0f61bf602c" }
+apogee-auth = { source = "github.com/venomous-maker/apogee-auth", version = "v0.2.2", commit = "e5f983d2f72949382b6d11291430c267ba3469c1" }
+apogee-session = { source = "github.com/venomous-maker/apogee-session", version = "v0.2.2", commit = "d24a66f38a6283fe19b341e0d9ea55451e00b865" }
+apogee-validation = { source = "github.com/venomous-maker/apogee-validation", version = "v0.2.1", commit = "cc32e20f5bbffeb1c02774923c2217be1644e3a7" }
 grav-redis = { source = "github.com/venomous-maker/grav-redis", version = "v0.2.1", commit = "f3dff2ec9efc3f53d2cd3c394fc412e4776244c3" }
 grav-db = { source = "github.com/venomous-maker/grav-db", version = "v0.2.0", commit = "8d60a239249f8533d750d70625baa0a33b991cfd" }
 apogee-config = { source = "github.com/venomous-maker/apogee-config", version = "v0.2.0", commit = "0d452e5b9098cec8b925a752a219b750e24fe00d" }
 apogee-container = { source = "github.com/venomous-maker/apogee-container", version = "v0.2.0", commit = "f027cc66880e602a500174bf3f28fe6d943f727a" }
+apogee-crypt = { source = "github.com/venomous-maker/apogee-crypt", version = "v0.2.0", commit = "e5efbb24dc73fcd675e7ba2b3cacb4124881cace" }
