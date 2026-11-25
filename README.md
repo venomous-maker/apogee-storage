@@ -5,7 +5,7 @@ folder on this machine, an S3-compatible bucket (Amazon S3, Cloudflare R2,
 Backblaze B2, DigitalOcean Spaces, SeaweedFS, MinIO, ...), or memory for
 tests. Public URLs, temporary URLs for private files, and a fake for tests.
 
-```grav
+```typescript
 import "std"
 import "apogee-storage"
 use apogee.*
