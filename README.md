@@ -18,6 +18,21 @@ let link = Storage.disk("s3").temporaryUrl("avatars/42.png", 300)   // works for
 let text = Storage.get("notes/today.txt")                            // the default disk (the first added)
 ```
 
+## In an apogee-framework app
+
+Importing the module is all it takes: `StoragePackage` (apogee-package) connects it when
+the app is created. The `local` and `public` disks are added under the app folder, and `s3` when a bucket is set; `filesystems.default` is the default disk. Disks sign URLs with the app key when it is long enough.
+
+| Setting | Default |
+|---|---|
+| `filesystems.default` | `FILESYSTEM_DISK`, `local` |
+| `filesystems.disks.local.root` | `storage/app` |
+| `filesystems.disks.public.root`, `.url` | `storage/app/public`, `APP_URL` + `/storage` |
+| `filesystems.disks.s3.bucket`, `.region`, `.key`, `.secret` | `AWS_BUCKET`, `AWS_DEFAULT_REGION` (`us-east-1`), `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
+| `filesystems.disks.s3.endpoint`, `.path_style` | `AWS_ENDPOINT` (another S3-compatible service), `AWS_USE_PATH_STYLE_ENDPOINT` (on) |
+
+Your own configuration wins over these defaults.
+
 ## Disks
 
 | | |
@@ -64,6 +79,7 @@ continuation tokens past 1,000 keys.
 
 ```bash
 grav test tests/storage.grav        # needs nothing
+grav test tests/package.grav
 grav test tests/s3.grav             # needs an S3-compatible server
 ```
 
