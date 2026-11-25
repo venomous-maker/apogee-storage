@@ -1,0 +1,52 @@
+// package.grav — how apogee-storage connects itself to an app (apogee-package):
+// the local and public disks, s3 when a bucket is set; filesystems.default first.
+import "std"
+import "apogee-config"
+import "apogee-package"
+import "apogee-crypt"
+import "storage.grav"
+import "s3.grav"
+
+namespace apogee {
+
+    class StoragePackage extends ApogeePackage {
+        constructor() {}
+        fn name() -> string { return "storage"; }
+        fn defaults() -> HashMap<string, any> {
+            return {"filesystems.default": Env.get("FILESYSTEM_DISK", "local"),
+                    "filesystems.disks.local.root": Packages.path("storage/app"),
+                    "filesystems.disks.public.root": Packages.path("storage/app/public"),
+                    "filesystems.disks.public.url": Env.get("APP_URL", "http://localhost:8000") + "/storage",
+                    "filesystems.disks.s3.bucket": Env.get("AWS_BUCKET", ""),
+                    "filesystems.disks.s3.region": Env.get("AWS_DEFAULT_REGION", "us-east-1"),
+                    "filesystems.disks.s3.key": Env.get("AWS_ACCESS_KEY_ID", ""),
+                    "filesystems.disks.s3.secret": Env.get("AWS_SECRET_ACCESS_KEY", ""),
+                    "filesystems.disks.s3.endpoint": Env.get("AWS_ENDPOINT", ""),
+                    "filesystems.disks.s3.path_style": Env.getBool("AWS_USE_PATH_STYLE_ENDPOINT", true)};
+        }
+        fn register(app: PackageContext) {
+            let disks = new HashMap<string, Disk>();
+            // (signed URLs need a key long enough to sign with; without one, disks still work)
+            let key = "";
+            try {
+                new CryptKeys(app.key)
+                key = app.key
+            } catch (x: ValueError) {}
+            disks.put("local", new LocalDisk(Config.getString("filesystems.disks.local.root"), "", key));
+            disks.put("public", new LocalDisk(Config.getString("filesystems.disks.public.root"), Config.getString("filesystems.disks.public.url"), key));
+            let bucket = Config.getString("filesystems.disks.s3.bucket");
+            if (bucket != "") {
+                let b = "filesystems.disks.s3.";
+                let endpoint = Config.getString(b + "endpoint");
+                let cfg = endpoint == ""
+                    ? S3Config.aws(bucket, Config.getString(b + "region"), Config.getString(b + "key"), Config.getString(b + "secret"))
+                    : new S3Config(bucket, Config.getString(b + "region"), Config.getString(b + "key"), Config.getString(b + "secret"), endpoint, Config.getBool(b + "path_style", true));
+                disks.put("s3", new S3Disk(cfg));
+            }
+            // (the default disk is the first added)
+            let def = Config.getString("filesystems.default", "local");
+            if (disks.containsKey(def)) { Storage.addDisk(def, disks.get(def)); }
+            for ((name, d) in disks) { if (name != def) { Storage.addDisk(name, d); } }
+        }
+    }
+}
