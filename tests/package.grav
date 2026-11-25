@@ -9,11 +9,13 @@ use apogee.*
 test "the package connects itself" {
     let dir = Dir.temp() + "/storage_pkg_" + str(Process.pid())
     Packages.basePath = dir
-    let ps = Packages.discover()
-    assertEq(ps.size(), 1)
+    let ps = Packages.discover()                                               // (CryptPackage comes too)
+    let p: ApogeePackage = null
+    for (x in ps) { if (x.name() == "storage") { p = x } }
+    assert(p != null)
     Packages.applyDefaults(ps)
     assertEq(Config.getString("filesystems.disks.local.root"), dir + "/storage/app")
-    ps[0].register(new PackageContext(new Container(), "testing", ""))
+    p.register(new PackageContext(new Container(), "testing", ""))
     Storage.disk().put("a.txt", "hi")
     assertEq(Storage.disk("local").get("a.txt"), "hi")
     assert(new File(dir + "/storage/app/a.txt").exists())
